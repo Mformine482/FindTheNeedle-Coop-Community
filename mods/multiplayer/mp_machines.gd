@@ -55,6 +55,7 @@ const FIELDS := {
 
 # Machines that keep running on clients but whose settings still have to match.
 const SETTINGS_ONLY := ["work_lamps"]
+const POWER_FIELDS := ["power_line", "power_blocked", "power", "line_power"]
 
 # The areas a machine watches for something to eat. Named rather than walked,
 # because a machine's other areas are the scanner's beam and the stairs' climb
@@ -103,6 +104,10 @@ var _vals := {}     # key -> Dictionary of fields last broadcast
 var _goal := {}     # key -> {part index: Transform3D}
 var _nodes := {}    # key -> machine node
 var _group := {}    # key -> which build array it came from
+var _power_nodes := {}
+var _power_sent := {}
+var _power_received := {}
+var _power_local := {}
 var _scan_t := 0.0
 var _t := 0.0
 var _field_t := 0.0
@@ -141,6 +146,10 @@ func shutdown() -> void:
 	_ids.clear()
 	_slot.clear()
 	_group.clear()
+	_power_nodes.clear()
+	_power_sent.clear()
+	_power_received.clear()
+	_power_local.clear()
 
 
 # ------------------------------------------------------------------ the parts
@@ -159,6 +168,16 @@ func _rescan() -> void:
 	_ids.clear()
 	_slot.clear()
 	_group.clear()
+	_power_nodes.clear()
+	var grid: Variant = builds.get("grid")
+	var candidates: Array = builds.every_placed()
+	if is_instance_valid(grid):
+		candidates = candidates + grid.machines()
+	for machine in candidates:
+		if is_instance_valid(machine) and machine is Node3D and machine.is_inside_tree() \
+		and machine.has_method("set_power") and "power_line" in machine:
+			_power_nodes[_key(machine.get_script().resource_path, machine)] = machine
+	_resolve_power_keys()
 	for group in groups + SETTINGS_ONLY:
 		var arr: Variant = builds.get(group)
 		if not (arr is Array):
@@ -196,28 +215,33 @@ func _local_key(key: String) -> String:
 		_rescan()
 		if _nodes.has(key):
 			return key
+	var best := _near_key(key, _nodes)
+	if best != "":
+		_alias[key] = best
+	return best
+
+
+func _near_key(key: String, nodes: Dictionary) -> String:
 	var bar := key.find("|")
 	if bar < 0:
 		return ""
-	var group := key.substr(0, bar)
+	var prefix := key.substr(0, bar + 1)
 	var xyz := key.substr(bar + 1).split(",")
 	if xyz.size() != 3:
 		return ""
 	var at := Vector3(float(xyz[0]), float(xyz[1]), float(xyz[2]))
 	var best := ""
 	var best_d := KEY_SLACK * KEY_SLACK
-	for k in _nodes:
-		if _group.get(k, "") != group:
+	for k in nodes:
+		if not String(k).begins_with(prefix):
 			continue
-		var n: Variant = _nodes[k]
+		var n: Variant = nodes[k]
 		if n == null or not is_instance_valid(n):
 			continue
 		var d := (n as Node3D).global_position.distance_squared_to(at)
 		if d < best_d:
 			best_d = d
 			best = k
-	if best != "":
-		_alias[key] = best
 	return best
 
 
@@ -296,6 +320,7 @@ func _process(delta: float) -> void:
 		if _edit_t >= EDIT_TICK:
 			_edit_t = 0.0
 			_send_edits()
+		_apply_power()
 		return
 	if mp.players.size() < 2:
 		return
@@ -315,6 +340,7 @@ func _process(delta: float) -> void:
 	if _field_t >= FIELD_TICK:
 		_field_t = 0.0
 		_send_fields()
+		_send_power()
 	_mouth_t += delta
 	if _mouth_t >= MOUTH_TICK:
 		_mouth_t = 0.0
@@ -527,6 +553,52 @@ func _send_fields() -> void:
 	if batch.is_empty():
 		return
 	mp._rx_machine_fields.rpc(batch)
+
+
+func _send_power(pid: int = 0) -> void:
+	var state := {}
+	for key in _power_nodes:
+		var machine: Variant = _power_nodes[key]
+		if not is_instance_valid(machine):
+			continue
+		var values := {}
+		for field in POWER_FIELDS:
+			var value: Variant = machine.get(field)
+			if value != null:
+				values[field] = value
+		state[key] = values
+	if pid != 0:
+		mp._rx_machine_power.rpc_id(pid, state)
+	elif state != _power_sent:
+		_power_sent = state
+		mp._rx_machine_power.rpc(state)
+
+
+func on_power(state: Dictionary) -> void:
+	_power_received = state
+	_resolve_power_keys()
+	_apply_power()
+
+
+func _resolve_power_keys() -> void:
+	_power_local.clear()
+	for key in _power_received:
+		var local: String = key if _power_nodes.has(key) else _near_key(key, _power_nodes)
+		if local != "":
+			_power_local[local] = _power_received[key]
+
+
+func _apply_power() -> void:
+	# The guest still builds its own grid for wiring and panels. Its local
+	# calculation can overwrite the values that drive a machine's warning.
+	for key in _power_local:
+		var machine: Variant = _power_nodes.get(key)
+		if not is_instance_valid(machine):
+			continue
+		var values: Dictionary = _power_local[key]
+		for field in POWER_FIELDS:
+			if values.has(field) and machine.get(field) != values[field]:
+				_apply_field(machine, field, values[field])
 
 
 # ------------------------------------------------------------------ from the net
@@ -764,11 +836,12 @@ func _ease(delta: float) -> void:
 
 # A client just arrived: forget what we think it knows, so the next ticks
 # send every pose, flag and setting again.
-func send_all(_pid: int) -> void:
+func send_all(pid: int) -> void:
 	_rescan()
 	_sent.clear()
 	_flags.clear()
 	_vals.clear()
+	_send_power(pid)
 
 
 # ------------------------------------------------------------------ glow

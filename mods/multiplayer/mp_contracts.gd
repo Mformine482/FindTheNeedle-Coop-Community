@@ -20,6 +20,8 @@ var _t := 0.0
 var _full_t := 0.0
 var _last := {}
 var _stopped := false
+var _reported_index := -1
+var _truck_contract := -1
 
 
 func start(mp_node: Node, world_node: Node) -> void:
@@ -70,12 +72,40 @@ func _process(delta: float) -> void:
 
 func _state() -> Dictionary:
 	var tr := _truck()
+	var index: int = GameState.contract_index
+	var truck_state := int(tr.get("state")) if tr != null else -1
+	if truck_state == DeliveryTruck.State.ARRIVING or (truck_state == DeliveryTruck.State.PARKED and _truck_contract < 0):
+		_truck_contract = index
+	elif truck_state == DeliveryTruck.State.LEAVING and _truck_contract < 0:
+		_truck_contract = maxi(0, index - 1)
+	elif truck_state == DeliveryTruck.State.AWAY:
+		_truck_contract = -1
 	return {
-		"index": GameState.contract_index,
+		"index": index,
 		"delivered": GameState.contract_delivered,
+		"parts": GameState.contract_parts.duplicate(),
 		"done": GameState.contracts_done.keys(),
-		"truck": int(tr.get("state")) if tr != null else -1,
+		"truck": truck_state,
+		"rig": _truck_contract,
+		"cargo": _cargo(tr),
 	}
+
+
+func _cargo(tr: Node) -> Dictionary:
+	var counts := {}
+	if tr == null:
+		return counts
+	var models: Dictionary = tr.get("_load")
+	for id in models:
+		var mesh: MultiMesh = models[id].multimesh
+		var count := mesh.visible_instance_count
+		if count > 0:
+			counts[id] = count
+	return counts
+
+
+func send_now(pid: int) -> void:
+	mp._rx_contract.rpc_id(pid, _state())
 
 
 func on_state(s: Dictionary) -> void:
@@ -83,19 +113,22 @@ func on_state(s: Dictionary) -> void:
 		return
 	var index := int(s.get("index", GameState.contract_index))
 	var delivered := int(s.get("delivered", 0))
-	var was_index: int = GameState.contract_index
-	var was_delivered: int = GameState.contract_delivered
+	var parts: Dictionary = s.get("parts", {})
+	var progress_changed: bool = index != GameState.contract_index \
+		or delivered != GameState.contract_delivered or parts != GameState.contract_parts
+	var was_index := _reported_index
+	_reported_index = index
 	var tr := _truck()
 	# a contract closed on the host: tick it off here too
-	if index > was_index:
+	if was_index >= 0 and index > was_index:
 		var dd := _director()
 		if dd != null and dd.get("panel") != null:
 			dd.panel.mark_complete(DeliveryBook.title_of(was_index))
 		Audio.play("sell_register", -2.0)
 		Audio.play_delayed("coins", 0.18, -3.0)
-		was_delivered = 0
 	GameState.contract_index = index
 	GameState.contract_delivered = delivered
+	GameState.contract_parts = parts.duplicate()
 	var done := {}
 	for id in s.get("done", []):
 		done[str(id)] = true
@@ -109,17 +142,33 @@ func on_state(s: Dictionary) -> void:
 	ours.sort()
 	if theirs != ours:
 		GameState.contracts_done = done
+	if progress_changed or theirs != ours:
 		GameState.contracts_changed.emit()
 	if tr != null:
-		_follow_truck(tr, int(s.get("truck", -1)))
-		# what went into the host's truck, stacked in ours
-		if index == was_index and delivered > was_delivered:
-			var want := str(DeliveryBook.contract(index).get("want", ""))
-			for i in delivered - was_delivered:
-				tr.stack_one(want)
+		_sync_truck(tr, int(s.get("truck", -1)), int(s.get("rig", -1)), s.get("cargo", {}))
 	var dd2 := _director()
 	if dd2 != null:
 		dd2._restate()
+
+
+func _sync_truck(tr: Node, state: int, rig: int, cargo: Dictionary) -> void:
+	var have := _cargo(tr)
+	var reset := rig != _truck_contract
+	for id in have:
+		if int(have[id]) > int(cargo.get(id, 0)):
+			reset = true
+	var dd := _director()
+	if reset and rig >= 0 and dd != null:
+		dd._rig(rig)
+		_truck_contract = rig
+	_follow_truck(tr, state)
+	if rig < 0:
+		_truck_contract = -1
+		return
+	have = _cargo(tr)
+	for id in cargo:
+		for i in maxi(0, int(cargo[id]) - int(have.get(id, 0))):
+			tr.stack_one(id)
 
 
 # The truck drives itself once told to come or go, so only the moves are sent.

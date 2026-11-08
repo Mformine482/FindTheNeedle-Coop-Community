@@ -46,6 +46,7 @@ var _held_t := 0.0
 var _hidden := {}   # mp id -> the layer a hidden copy had, while it is hidden
 var _held := {}     # mp id -> true while its owner says they're carrying it
 var _pushed := {}   # mp id -> avatar placing that copy in its hands
+var _barrow_stored := {}  # last observed fill on a remote wheelbarrow
 var _boarded := {}  # mp id -> where one of ours got on a belt, guest only
 var _belt_t := 0.0
 var _log := OS.get_environment("MP_DEBUG_PROPS") != ""  # dev tracing
@@ -95,6 +96,7 @@ func shutdown() -> void:
 	_pushed.clear()
 	_boarded.clear()
 	_held.clear()
+	_barrow_stored.clear()
 	_hidden.clear()
 	_by_id.clear()
 	_owner.clear()
@@ -148,6 +150,7 @@ func _adopt(item: Node, id: int, owner: int) -> void:
 func _forget(id: int) -> void:
 	_hidden.erase(id)
 	_held.erase(id)
+	_barrow_stored.erase(id)
 	_by_id.erase(id)
 	_owner.erase(id)
 	_sent.erase(id)
@@ -163,6 +166,8 @@ func _puppet(item: Node) -> void:
 	item.freeze_mode = RigidBody3D.FREEZE_MODE_STATIC
 	item.freeze = true
 	item.set_physics_process(false)
+	if item is Wheelbarrow:
+		_barrow_stored[int(item.get_meta("mp_id"))] = item.stored
 	# a new hay tuft starts with no collision layer and gets it back in its own
 	# physics tick once no straw is inside it; that tick is off on a copy, so the
 	# copy stayed out of everyone's aim and only its maker could pick it up
@@ -208,7 +213,11 @@ func _mine(id: int) -> bool:
 # its own tick, and the delete goes out like any other. This is how hay a guest
 # loads finally counts, and it still only counts once, here.
 func host_take(item: Variant) -> bool:
-	if not mp.is_host or item == null or not is_instance_valid(item):
+	return mp.is_host and _take_remote_prop(item)
+
+
+func _take_remote_prop(item: Variant) -> bool:
+	if item == null or not is_instance_valid(item):
 		return false
 	var n := item as Node
 	if n == null or not n.has_meta("mp_id"):
@@ -217,13 +226,18 @@ func host_take(item: Variant) -> bool:
 	# theirs to carry for as long as they are carrying it
 	if _mine(id) or bool(_held.get(id, false)):
 		return false
+	_claim_local(id)
+	_release(n)
+	return true
+
+
+func _claim_local(id: int) -> void:
 	_owner[id] = _me()
 	_goal.erase(id)
 	_held.erase(id)
 	_hash.erase(id)
-	_release(n)
+	_sent.erase(id)
 	mp._rx_prop_claim.rpc(id)
-	return true
 
 
 # ------------------------------------------------------------------ local events
@@ -391,6 +405,109 @@ func _state_of(item: Node) -> Dictionary:
 	return st
 
 
+func _update_barrows() -> void:
+	if mp.players.size() < 2:
+		return
+	for id in _by_id.keys():
+		var barrow: Variant = _by_id.get(id)
+		if not is_instance_valid(barrow) or not (barrow is Wheelbarrow) or not barrow.is_inside_tree():
+			continue
+		if not _mine(id):
+			_collect_local_straw(barrow)
+			_flush_barrow_fill(id, barrow)
+			continue
+		var dock: Variant = barrow.docked_in
+		if is_instance_valid(dock):
+			if not mp.is_host and dock is DumpHatch and dock.load_item() == barrow:
+				var state := _state_of(barrow)
+				var at: Vector3 = dock.global_position
+				# The host runs the loader. Release its stationary local copy
+				# first so it cannot keep the guest's barrow clamped.
+				dock.give_back_load()
+				if not is_instance_valid(barrow.docked_in):
+					mp._rx_barrow_dock.rpc_id(1, id, at, state)
+			continue
+		# A frozen replica is skipped by the game's load collector. The
+		# barrow owner takes over eligible cargo already inside its tray.
+		for area in [barrow.get("_interior"), barrow.get("_stack")]:
+			if not (area is Area3D) or not area.monitoring:
+				continue
+			for cargo in area.get_overlapping_bodies():
+				if cargo is Carryable and cargo.has_meta("mp_copy") \
+				and not BeltPath.is_rider(cargo) and barrow.would_take(cargo):
+					_take_remote_prop(cargo)
+
+
+func _collect_local_straw(barrow: Wheelbarrow) -> void:
+	var tray: Area3D = barrow.get("_interior")
+	var live: Variant = world.get("live")
+	if not is_instance_valid(tray) or not tray.monitoring or not is_instance_valid(live):
+		return
+	if barrow.global_basis.y.normalized().dot(Vector3.UP) < 0.75 or is_instance_valid(barrow.docked_in):
+		return
+	for straw in tray.get_overlapping_bodies():
+		if barrow.loose_room() <= 0:
+			break
+		_store_local_straw(barrow, straw, live)
+
+
+func _store_local_straw(barrow: Wheelbarrow, straw: Node, live: Node) -> void:
+	if not (straw is RigidBody3D) or not (straw.collision_layer & Cfg.L_STRAND):
+		return
+	if straw.has_meta("mp_ghost") or straw.has_meta("needle_index") \
+	or bool(straw.get_meta(LiveStrandManager.META_PROTECTED, false)):
+		return
+	if barrow.put_in(1) == 1:
+		live.consume(straw)
+
+
+func _flush_barrow_fill(id: int, barrow: Wheelbarrow) -> void:
+	var stored: int = barrow.stored
+	var added := stored - int(_barrow_stored.get(id, stored))
+	_barrow_stored[id] = stored
+	if added > 0:
+		mp._rx_barrow_fill.rpc_id(int(_owner[id]), id, added)
+
+
+func on_barrow_fill(id: int, amount: int) -> void:
+	var barrow: Variant = _by_id.get(id)
+	if not _mine(id) or not is_instance_valid(barrow) or not (barrow is Wheelbarrow) \
+	or not barrow.is_inside_tree() or amount <= 0 or amount > barrow.capacity():
+		return
+	var rest: int = amount - barrow.put_in(amount)
+	if rest > 0:
+		# Another player may have filled the remaining space in the meantime.
+		# Keep the surplus as loose hay at the front of the wheelbarrow.
+		var xf: Transform3D = barrow.global_transform
+		xf.origin = barrow.pour_point() + Vector3.UP * 0.2
+		props.spawn("hay_tuft", xf, {"strands": rest})
+	_hash.erase(id)
+	_state_t = STATE_TICK
+
+
+func on_barrow_dock(sender: int, id: int, at: Vector3, state: Dictionary) -> void:
+	if int(_owner.get(id, 0)) != sender or not at.is_finite():
+		return
+	var barrow: Variant = _by_id.get(id)
+	if not is_instance_valid(barrow) or not (barrow is Wheelbarrow) or not barrow.is_inside_tree():
+		return
+	if is_instance_valid(barrow.docked_in) or barrow.global_position.distance_to(at) > 4.0:
+		return
+	var builds: Variant = world.get("builds")
+	if not is_instance_valid(builds):
+		return
+	for hatch in builds.dump_hatches:
+		if not is_instance_valid(hatch) or hatch.global_position.distance_to(at) > 0.3 or hatch.is_busy():
+			continue
+		barrow.from_state(state)
+		_release(barrow)
+		if hatch.take(barrow):
+			_claim_local(id)
+		else:
+			_puppet(barrow)
+		return
+
+
 # ------------------------------------------------------------------ ticks
 
 func _process(delta: float) -> void:
@@ -416,6 +533,7 @@ func _process(delta: float) -> void:
 		_move_t = 0.0
 		_move_tick()
 		_claim_in_reach()
+		_update_barrows()
 	_state_t += delta
 	if _state_t >= STATE_TICK:
 		_state_t = 0.0
@@ -628,8 +746,7 @@ func on_move(sender: int, ids: PackedInt64Array, xfs: Array) -> void:
 			_want[id] = sender
 			continue
 		if int(_owner.get(id, 0)) != sender:
-			_owner[id] = sender
-			_puppet(it)
+			continue
 		if it.is_held():
 			continue
 		_goal[id] = xfs[i]
@@ -644,8 +761,14 @@ func on_state(sender: int, ids: PackedInt64Array, states: Array) -> void:
 		if it == null or not is_instance_valid(it):
 			_want[id] = sender
 			continue
+		if int(_owner.get(id, 0)) != sender:
+			continue
 		var st: Dictionary = states[i]
+		if it is Wheelbarrow:
+			_flush_barrow_fill(id, it)
 		it.from_state(st)
+		if it is Wheelbarrow:
+			_barrow_stored[id] = it.stored
 		it.needle_index = int(st.get("needle", -1))
 		_note_held(id, st)
 
@@ -755,6 +878,7 @@ func on_reset(first: bool, ids: PackedInt64Array, owners: PackedInt32Array, entr
 		_goal.clear()
 		_want.clear()
 		_held.clear()
+		_barrow_stored.clear()
 	for i in ids.size():
 		var e: Dictionary = entries[i]
 		var item_id: String = e.get("id", "")

@@ -19,6 +19,8 @@ var world: Node
 var _t := 0.0
 var _since := 0.0
 var _last_hash := 0
+var _pending := PackedByteArray()
+var _pending_size := 0
 
 
 func start(mp_node: Node, world_node: Node) -> void:
@@ -40,6 +42,11 @@ func shutdown() -> void:
 
 
 func _process(delta: float) -> void:
+	if _pending_size != 0 and mp.world_sync != null and not mp.world_sync.builds_busy():
+		var raw_size := _pending_size
+		_pending_size = 0
+		on_belts(_pending, raw_size)
+		_pending.clear()
 	if mp == null or not mp.is_host or not mp.active():
 		return
 	if multiplayer.multiplayer_peer == null:
@@ -84,6 +91,11 @@ func send_all(pid: int = 0) -> void:
 func on_belts(packed: PackedByteArray, raw_size: int) -> void:
 	if raw_size <= 0 or raw_size > MAX_RAW:
 		return
+	if mp.world_sync != null and mp.world_sync.builds_busy():
+		_pending = packed
+		_pending_size = raw_size
+		return
+	_pending_size = 0
 	var raw := packed.decompress(raw_size, FileAccess.COMPRESSION_ZSTD)
 	var entries: Variant = bytes_to_var(raw)
 	if not (entries is Array):

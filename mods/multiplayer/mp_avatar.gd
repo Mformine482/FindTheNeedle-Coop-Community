@@ -72,6 +72,10 @@ var _hand: Node3D
 var _tool_node: Node3D
 var _posed := {}  # holder, mount, box, longest, pose while a saved pose is in use
 var _label: Label3D
+var _emote_icon: Sprite3D
+var _emote_id := ""
+var _emote := {}
+var _emote_time := 0.0
 var _name := ""
 var _color := Color.WHITE
 static var _model_cache := {}
@@ -310,7 +314,9 @@ func _animate_farmer(delta: float) -> void:
 		_place_barrow()
 		_reach_grips(right)
 	var holding := _tool_node != null and not pushing
-	if holding and _b_upper >= 0 and _b_lower >= 0:
+	if not pushing and not _emote.is_empty() and _b_upper >= 0 and _b_lower >= 0:
+		_pose_emote(right, fwd)
+	elif holding and _b_upper >= 0 and _b_lower >= 0:
 		# elbow by the side, forearm out front
 		_aim_bone(_b_upper, fwd.rotated(right, -1.05 + _pitch * 0.25))
 		_aim_bone(_b_lower, fwd.rotated(right, -0.3 + _pitch * 0.8))
@@ -524,7 +530,7 @@ func _process(delta: float) -> void:
 	_crouch_now = lerpf(_crouch_now, _crouch, k)
 	if _tool_node != null:
 		# both hands are on the wheelbarrow
-		_tool_node.visible = not _pushing()
+		_tool_node.visible = not _pushing() and _emote.is_empty()
 	if _skel != null:
 		_animate_farmer(delta)
 		_label.position.y = EYE + 0.55 - crouch_drop * _crouch_now
@@ -536,6 +542,51 @@ func _process(delta: float) -> void:
 	var tool_txt: String = TOOL_NAMES[_tool] if _tool >= 0 and _tool < TOOL_NAMES.size() else ""
 	# no tool in the tag while both hands are on the barrow
 	_label.text = _name if tool_txt == "" or _tool == 0 or _pushing() else "%s\n[%s]" % [_name, tr(tool_txt)]
+	if _emote_icon != null:
+		_emote_icon.position = _label.position + Vector3.UP * 0.32
+		if _emote_icon.texture == null and not _emote.is_empty():
+			_label.text += "\n" + tr(str(_emote.get("name", _emote_id)))
+
+
+func set_emote(catalog: Script, id: String, at: float) -> void:
+	_emote_time = clampf(at, 0.0, 12.0) if is_finite(at) else 0.0
+	if id == _emote_id:
+		return
+	_emote_id = id
+	_emote = catalog.call("get_emote", id) if catalog != null and id != "" else {}
+	if _emote_icon == null and not _emote.is_empty():
+		_emote_icon = Sprite3D.new()
+		_emote_icon.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		_emote_icon.no_depth_test = true
+		_emote_icon.shaded = false
+		add_child(_emote_icon)
+	if _emote_icon != null:
+		var tex: Texture2D = catalog.call("icon", id) if not _emote.is_empty() else null
+		_emote_icon.texture = tex
+		_emote_icon.visible = tex != null
+		if tex != null:
+			_emote_icon.pixel_size = 0.24 / maxf(tex.get_width(), tex.get_height())
+
+
+func _pose_emote(right: Vector3, forward: Vector3) -> void:
+	var pose := {}
+	var elapsed := _emote_time
+	for key in _emote.get("keys", []):
+		if key.has("r"):
+			pose = key["r"]
+		elapsed -= float(key.get("t", 0.0)) + float(key.get("w", 0.0))
+		if elapsed <= 0.0:
+			break
+	var wrist: Array = pose.get("wrist", [0.35, 0.7, 0.35])
+	var tip: Array = pose.get("tip", [])
+	var upper := right * float(wrist[0]) + forward * float(wrist[2]) + Vector3.UP * (0.55 - float(wrist[1]))
+	var lower := forward if pose.get("straight", false) else Vector3.UP
+	if tip.size() == 3:
+		lower = right * float(tip[0] - wrist[0]) + forward * float(tip[2] - wrist[2]) + Vector3.UP * float(wrist[1] - tip[1])
+	if _emote_id == "wave":
+		lower = lower.rotated(forward, sin(_emote_time * TAU * 2.0) * 0.4)
+	_aim_bone(_b_upper, upper)
+	_aim_bone(_b_lower, lower)
 
 
 func _follow_player(delta: float) -> void:

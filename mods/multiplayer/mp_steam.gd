@@ -16,6 +16,9 @@ var steam_id := 0
 var persona := ""
 var lobby_id := 0
 var lobby_owner := 0
+var _creating_lobby := false
+var _joining_lobby := 0
+var _cancelled_lobby_request := false
 
 signal lobby_created(ok: bool, id: int)
 signal lobby_joined(ok: bool, id: int, reason: String)
@@ -116,7 +119,6 @@ func _connect_signals() -> void:
 	_link("join_requested", _on_join_requested)
 	_link("join_game_requested", _on_join_game_requested)
 	_link("lobby_chat_update", _on_lobby_chat_update)
-	_link("lobby_invite", _on_lobby_invite)
 
 
 func _link(sig: String, cb: Callable) -> void:
@@ -126,17 +128,28 @@ func _link(sig: String, cb: Callable) -> void:
 
 # ---------------------------------------------------------------- lobbies
 
+func lobby_request_pending() -> bool:
+	return _creating_lobby or _joining_lobby != 0
+
+
 func host_lobby(max_players: int = 8) -> void:
-	# 2 = LOBBY_TYPE_PUBLIC is searchable; FRIENDS_ONLY keeps it to invites
+	_creating_lobby = true
+	# LOBBY_TYPE_FRIENDS_ONLY keeps the lobby out of public searches.
 	steam.call("createLobby", 1, max_players)
 
 
 func join_lobby(id: int) -> void:
+	_joining_lobby = id
 	steam.call("joinLobby", id)
 
 
 func leave_lobby() -> void:
+	if lobby_request_pending():
+		# Steam may still return a successful result after we cancel locally.
+		_cancelled_lobby_request = true
 	if lobby_id != 0:
+		if lobby_owner == steam_id:
+			steam.call("setRichPresence", "connect", "")
 		steam.call("leaveLobby", lobby_id)
 		lobby_id = 0
 		lobby_owner = 0
@@ -175,6 +188,11 @@ func get_lobby_data(key: String) -> String:
 
 
 func _on_lobby_created(connect_code: int, id: int) -> void:
+	if not _creating_lobby:
+		return
+	_creating_lobby = false
+	if _discard_cancelled_lobby(id, connect_code == 1):
+		return
 	if connect_code == 1:
 		lobby_id = id
 		lobby_owner = steam_id
@@ -212,6 +230,12 @@ func lobby_from_command_line() -> int:
 
 
 func _on_lobby_joined(id: int, _perms: int, _locked: bool, response: int) -> void:
+	# Creating a lobby also produces a lobby_joined callback.
+	if _joining_lobby == 0 or id != _joining_lobby:
+		return
+	_joining_lobby = 0
+	if _discard_cancelled_lobby(id, response == 1):
+		return
 	if response == 1:
 		lobby_id = id
 		lobby_owner = int(steam.call("getLobbyOwner", id))
@@ -224,8 +248,13 @@ func _on_join_requested(id: int, _friend_id: int) -> void:
 	join_requested.emit(id)
 
 
-func _on_lobby_invite(_inviter: int, id: int, _game: int) -> void:
-	join_requested.emit(id)
+func _discard_cancelled_lobby(id: int, entered: bool) -> bool:
+	if not _cancelled_lobby_request:
+		return false
+	_cancelled_lobby_request = false
+	if entered:
+		steam.call("leaveLobby", id)
+	return true
 
 
 func _on_lobby_chat_update(_id: int, _changed: int, _making: int, _state: int) -> void:
@@ -238,4 +267,8 @@ func _on_lobby_chat_update(_id: int, _changed: int, _making: int, _state: int) -
 func make_peer() -> MultiplayerPeer:
 	if not ClassDB.class_exists("SteamMultiplayerPeer"):
 		return null
+	# Steam reserves lanes for Godot's default transfer modes in addition to
+	# the explicit channels the mod uses for world, pose and hay messages.
+	var setting := "steam/multiplayer_peer/max_channels"
+	ProjectSettings.set_setting(setting, maxi(8, int(ProjectSettings.get_setting(setting, 4))))
 	return ClassDB.instantiate("SteamMultiplayerPeer")

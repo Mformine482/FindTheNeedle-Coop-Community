@@ -3,7 +3,7 @@
 # hand-off and every RPC. Per-world syncing lives in mp_world.gd.
 extends Node
 
-const VERSION := "0.19.5"
+const VERSION := "0.19.14"
 const DEFAULT_PORT := 7777
 const MAX_PEERS := 8  # players in a session, host included (Steam counts the same way)
 const WORLD_CHUNK := 60000
@@ -11,6 +11,8 @@ const SESSION_DIR := "user://mp_session"
 const SETTINGS_PATH := "user://mp_settings.cfg"
 const GAME_SCENE := "res://scenes/main.tscn"
 const MENU_SCENE := "res://scenes/main_menu.tscn"
+const PING_INTERVAL := 2.0
+const PING_TIMEOUT_MS := 6000
 
 const COLORS := [
 	Color(0.95, 0.35, 0.3), Color(0.3, 0.65, 0.98), Color(0.4, 0.85, 0.4),
@@ -40,9 +42,9 @@ var _world_rx := {}
 var _pending_world: Variant = null
 var _mp_world_load := false  # client is loading a world sent by the host
 var _world_watch: Node = null
-var _steam_hosting := false  # waiting for our own lobby to be created
-var _steam_joining := false  # we asked to join someone else (Steam also
-# reports lobby_joined to the creator, which is not a join we should act on)
+var _ping_elapsed := 0.0
+var _ping_pending := {}
+var ping_ms := {}  # guest peer id -> round-trip time to the host
 
 
 func _ready() -> void:
@@ -99,7 +101,7 @@ func t(key: String) -> String:
 	return i18n.t(key)
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	var cs := get_tree().current_scene
 	if cs != _last_scene:
 		_last_scene = cs
@@ -107,6 +109,11 @@ func _process(_delta: float) -> void:
 	if _world_watch != null and is_instance_valid(_world_watch) and world_sync == null:
 		if bool(_world_watch.get("_built")):
 			_start_world_sync(_world_watch)
+	if is_host and players.size() > 1:
+		_ping_elapsed += delta
+		if _ping_elapsed >= PING_INTERVAL:
+			_ping_elapsed = 0.0
+			_probe_players()
 
 
 # ---------------------------------------------------------------- scenes
@@ -123,7 +130,6 @@ func is_menu(n: Node) -> bool:
 func _on_scene_changed(cs: Node) -> void:
 	_stop_world_sync()
 	_stay_last.call_deferred()
-	_world_watch = null
 	if is_menu(cs):
 		ui.hook_menu(cs)
 		if active() and not is_host and phase == Phase.IN_WORLD:
@@ -178,6 +184,9 @@ func _exit_tree() -> void:
 
 
 func _stop_world_sync() -> void:
+	# A reload leaves the old scene current until the loading screen swaps it.
+	# Do not let _process restart sync on that scene in the meantime.
+	_world_watch = null
 	if world_sync != null:
 		world_sync.shutdown()
 		world_sync.queue_free()
@@ -221,10 +230,10 @@ func host_steam() -> bool:
 	if not steam_ready():
 		ui.notify(t("steam_unavailable_long"))
 		return false
+	if steam.lobby_request_pending():
+		return false
 	if active():
 		leave()
-	_steam_hosting = true
-	_steam_joining = false
 	ui.notify(t("steam_creating"))
 	steam.host_lobby(MAX_PEERS)
 	return true
@@ -234,11 +243,11 @@ func join_steam(lobby_id: int) -> bool:
 	if not steam_ready():
 		ui.notify(t("steam_unavailable"))
 		return false
+	if lobby_id <= 0 or lobby_id == steam.lobby_id or steam.lobby_request_pending():
+		return false
 	if active():
 		leave()
 	ui.notify(t("steam_entering"))
-	_steam_joining = true
-	_steam_hosting = false
 	phase = Phase.CONNECTING
 	steam.join_lobby(lobby_id)
 	ui.refresh()
@@ -253,17 +262,14 @@ func invite_friends() -> void:
 
 
 func _on_steam_lobby_created(ok: bool, id: int) -> void:
-	if not _steam_hosting:
-		return
-	_steam_hosting = false
 	if not ok:
 		ui.notify(t("steam_create_failed"))
 		return
 	var peer: MultiplayerPeer = steam.make_peer()
-	if peer == null:
+	if peer == null or peer.call("host_with_lobby", id) != OK:
+		steam.leave_lobby()
 		ui.notify(t("steam_peer_failed"))
 		return
-	peer.call("host_with_lobby", id)
 	multiplayer.multiplayer_peer = peer
 	over_steam = true
 	_become_host()
@@ -271,17 +277,13 @@ func _on_steam_lobby_created(ok: bool, id: int) -> void:
 
 
 func _on_steam_lobby_joined(ok: bool, id: int, reason: String) -> void:
-	if not _steam_joining:
-		return  # Steam tells the creator it "joined" its own lobby; ignore that
-	_steam_joining = false
 	if not ok:
 		leave(t("steam_join_failed") % reason)
 		return
 	var peer: MultiplayerPeer = steam.make_peer()
-	if peer == null:
+	if peer == null or peer.call("connect_to_lobby", id) != OK:
 		leave(t("steam_peer_failed"))
 		return
-	peer.call("connect_to_lobby", id)
 	multiplayer.multiplayer_peer = peer
 	over_steam = true
 	is_host = false
@@ -310,7 +312,7 @@ func _become_host() -> void:
 
 
 func host(port: int) -> bool:
-	if active():
+	if active() or (steam_ready() and steam.lobby_request_pending()):
 		leave()
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_server(port, MAX_PEERS - 1)
@@ -327,7 +329,7 @@ func host(port: int) -> bool:
 
 
 func join(ip: String, port: int) -> bool:
-	if active():
+	if active() or (steam_ready() and steam.lobby_request_pending()):
 		leave()
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_client(ip, port)
@@ -356,11 +358,12 @@ func leave(reason: String = "") -> void:
 	if steam_ready():
 		steam.leave_lobby()
 	over_steam = false
-	_steam_hosting = false
-	_steam_joining = false
 	phase = Phase.OFFLINE
 	is_host = false
 	players.clear()
+	ping_ms.clear()
+	_ping_pending.clear()
+	_ping_elapsed = 0.0
 	_world_rx.clear()
 	_mp_world_load = false
 	if world_sync != null:
@@ -427,6 +430,8 @@ func _on_peer_connected(id: int) -> void:
 
 func _on_peer_disconnected(id: int) -> void:
 	trace.note("peer %d disconnected" % id)
+	_ping_pending.erase(id)
+	ping_ms.erase(id)
 	if players.has(id):
 		ui.notify(t("left") % players[id]["name"], players[id]["color"])
 		players.erase(id)
@@ -475,6 +480,52 @@ func player_color(id: int) -> Color:
 
 
 # ---------------------------------------------------------------- lobby RPCs
+
+func _probe_players() -> void:
+	var now := Time.get_ticks_msec()
+	var expired := false
+	for id in players:
+		if id == 1:
+			continue
+		if _ping_pending.has(id):
+			if now - int(_ping_pending[id]) < PING_TIMEOUT_MS:
+				continue
+			if ping_ms.erase(id):
+				expired = true
+		_ping_pending[id] = now
+		_rx_ping_probe.rpc_id(id, now)
+	if expired:
+		_publish_ping()
+
+
+func _publish_ping() -> void:
+	_rx_ping_values.rpc(ping_ms)
+	ui.refresh_roster()
+
+
+@rpc("authority", "call_remote", "unreliable")
+func _rx_ping_probe(stamp: int) -> void:
+	_rx_ping_reply.rpc_id(1, stamp)
+
+
+@rpc("any_peer", "call_remote", "unreliable")
+func _rx_ping_reply(stamp: int) -> void:
+	var id := multiplayer.get_remote_sender_id()
+	if not is_host or not players.has(id) or int(_ping_pending.get(id, -1)) != stamp:
+		return
+	_ping_pending.erase(id)
+	var elapsed := Time.get_ticks_msec() - stamp
+	if elapsed <= PING_TIMEOUT_MS:
+		ping_ms[id] = elapsed
+	else:
+		ping_ms.erase(id)
+	_publish_ping()
+
+
+@rpc("authority", "call_remote", "reliable")
+func _rx_ping_values(values: Dictionary) -> void:
+	ping_ms = values
+	ui.refresh_roster()
 
 @rpc("any_peer", "call_remote", "reliable")
 func _rx_hello(pname: String, ver: String) -> void:
@@ -534,14 +585,14 @@ func _rx_players(list: Dictionary) -> void:
 @rpc("any_peer", "call_remote", "reliable")
 func _rx_client_ready() -> void:
 	_trace("client_ready")
-	if not is_host:
+	if not is_host or world_sync == null:
 		return
 	var id := multiplayer.get_remote_sender_id()
-	if players.has(id):
-		players[id]["state"] = "world"
-		_rx_players.rpc(players)
-	if world_sync != null:
-		world_sync.send_full_sync(id)
+	if not players.has(id) or players[id]["state"] != "loading":
+		return
+	players[id]["state"] = "world"
+	_rx_players.rpc(players)
+	world_sync.send_full_sync(id)
 	ui.refresh()
 
 
@@ -637,7 +688,7 @@ func _enter_mp_world(payload: Dictionary) -> void:
 	Loading.enter_scene(GAME_SCENE)
 
 
-# Host: re-send the whole world to every client (after a new pile, or on demand).
+# Host: re-send the whole world after a new pile replaces the current one.
 func resync_all() -> void:
 	if not is_host or world_sync == null:
 		return
@@ -649,27 +700,36 @@ func resync_all() -> void:
 @rpc("any_peer", "call_remote", "reliable")
 func _rx_request_world() -> void:
 	_trace("request_world")
-	if is_host and world_sync != null:
-		send_world(multiplayer.get_remote_sender_id())
+	if not is_host or world_sync == null:
+		return
+	var id := multiplayer.get_remote_sender_id()
+	if players.has(id) and players[id]["state"] == "world":
+		send_world(id)
 
 
 func request_resync() -> void:
-	if not active():
+	if not can_resync():
 		return
 	if is_host:
-		resync_all()
+		for id in players:
+			if id != 1 and players[id]["state"] == "world":
+				send_world(id)
 		ui.notify(t("resyncing_all"))
 	else:
 		_rx_request_world.rpc_id(1)
 		ui.notify(t("asking_world"))
 
 
+func can_resync() -> bool:
+	return in_world() and (phase == Phase.HOSTING or phase == Phase.IN_WORLD)
+
+
 # ---------------------------------------------------------------- in-world RPCs (forwarded to mp_world)
 
 @rpc("any_peer", "call_remote", "unreliable_ordered", 2)
-func _rx_pose(pos: Vector3, yaw: float, pitch: float, tool: int, crouch: float, moving: float, hands: int) -> void:
+func _rx_pose(pos: Vector3, yaw: float, pitch: float, tool: int, crouch: float, moving: float, hands: int, emote: String, emote_time: float) -> void:
 	if world_sync != null:
-		world_sync.on_pose(multiplayer.get_remote_sender_id(), pos, yaw, pitch, tool, crouch, moving, hands)
+		world_sync.on_pose(multiplayer.get_remote_sender_id(), pos, yaw, pitch, tool, crouch, moving, hands, emote, emote_time)
 
 
 @rpc("any_peer", "call_remote", "reliable", 3)
@@ -700,6 +760,13 @@ func _rx_builds(adds: Array, removes: Array) -> void:
 	_trace("builds", adds.size())
 	if world_sync != null:
 		world_sync.on_builds(adds, removes)
+
+
+@rpc("authority", "call_remote", "reliable", 0)
+func _rx_build_layout(packed: PackedByteArray, raw_size: int) -> void:
+	_trace("build_layout", packed.size())
+	if phase == Phase.IN_WORLD and world_sync != null:
+		world_sync.on_build_layout(packed, raw_size)
 
 
 @rpc("any_peer", "call_remote", "reliable", 0)
@@ -820,6 +887,21 @@ func _rx_prop_board(id: int, xf: Transform3D) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable", 0)
+func _rx_barrow_fill(id: int, amount: int) -> void:
+	var p := _props()
+	if p != null and players.has(multiplayer.get_remote_sender_id()):
+		p.on_barrow_fill(id, amount)
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
+func _rx_barrow_dock(id: int, at: Vector3, state: Dictionary) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	var p := _props()
+	if is_host and p != null and players.has(sender):
+		p.on_barrow_dock(sender, id, at, state)
+
+
+@rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_prop_want(ids: PackedInt64Array) -> void:
 	_trace("prop_want", ids.size())
 	var p := _props()
@@ -891,6 +973,13 @@ func _rx_machine_fields(batch: Dictionary) -> void:
 # A guest worked a machine's panel. The machine runs on the host, so the host
 # is the only one that acts on this; everyone else hears about it in the next
 # field tick like any other change.
+@rpc("authority", "call_remote", "reliable", 0)
+func _rx_machine_power(state: Dictionary) -> void:
+	_trace("machine_power", state.size())
+	if world_sync != null and world_sync.machines_sync != null:
+		world_sync.machines_sync.on_power(state)
+
+
 @rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_machine_edit(batch: Dictionary) -> void:
 	_trace("machine_edit", batch.size())

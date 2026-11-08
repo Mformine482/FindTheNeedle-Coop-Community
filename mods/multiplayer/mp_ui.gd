@@ -86,6 +86,9 @@ var _progress_v := -1.0
 func _ready() -> void:
 	layer = 110
 	process_mode = Node.PROCESS_MODE_ALWAYS
+	# mp.t() already localizes the mod's text, including formatted BBCode.
+	# Keep the game's translation pass from translating it a second time.
+	auto_translate_mode = Node.AUTO_TRANSLATE_MODE_DISABLED
 	_build_feed()
 	_build_roster()
 	_build_chat()
@@ -356,7 +359,7 @@ func _build_panel() -> void:
 	var row4 := HBoxContainer.new()
 	row4.add_theme_constant_override("separation", 10)
 	_leave_btn = _button(mp.t("disconnect"), func() -> void: mp.leave(mp.t("session_closed")))
-	_resync_btn = _button(mp.t("resync"), func() -> void: mp.request_resync())
+	_resync_btn = _button("%s (F8)" % mp.t("resync"), func() -> void: mp.request_resync(), true)
 	row4.add_child(_leave_btn)
 	row4.add_child(_resync_btn)
 	v.add_child(row4)
@@ -999,7 +1002,7 @@ func _apply_texts() -> void:
 	_host_btn.text = mp.t("create_server")
 	_join_btn.text = mp.t("join")
 	_leave_btn.text = mp.t("disconnect")
-	_resync_btn.text = mp.t("resync")
+	_resync_btn.text = "%s (F8)" % mp.t("resync")
 	_close_btn.text = mp.t("close")
 	_help_label.text = mp.t("panel_help")
 	_name_edit.placeholder_text = mp.t("name_hint")
@@ -1022,7 +1025,7 @@ func refresh() -> void:
 	_host_btn.disabled = on
 	_join_btn.disabled = on
 	_leave_btn.disabled = not on
-	_resync_btn.disabled = not (on and mp.in_world())
+	_resync_btn.visible = mp.can_resync()
 	_name_edit.editable = not on
 	_ip_edit.editable = not on
 	var lines := PackedStringArray()
@@ -1058,13 +1061,23 @@ func refresh() -> void:
 		_ips_btn.text = mp.t("show_ips")
 	# roster in the corner while playing together
 	_roster_on = on and mp.players.size() > 0
-	if _roster_on:
-		var rl := PackedStringArray()
-		for id in mp.players:
-			var p: Dictionary = mp.players[id]
-			rl.append("[right][color=#%s]●[/color] %s[/right]" % [(p["color"] as Color).to_html(false), _esc(str(p["name"]))])
-		_roster.text = "\n".join(rl)
+	refresh_roster()
 	_update_wait()  # sets both its own visibility and the roster's
+
+
+func refresh_roster() -> void:
+	if _roster == null or not _roster_on:
+		return
+	var lines := PackedStringArray()
+	for id in mp.players:
+		var p: Dictionary = mp.players[id]
+		var ping := ""
+		if id != 1:
+			var value := int(mp.ping_ms.get(id, -1))
+			ping = "  [color=#cbd5e1]%d ms[/color]" % value if value >= 0 else "  [color=#cbd5e1]—[/color]"
+		lines.append("[right][color=#%s]●[/color] %s%s[/right]" % [
+			(p["color"] as Color).to_html(false), _esc(str(p["name"])), ping])
+	_roster.text = "\n".join(lines)
 
 
 # ---------------------------------------------------------------- main menu

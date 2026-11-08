@@ -15,6 +15,8 @@ const HAY_FULL_SCAN := 3.0
 const HAY_EPS := 0.002
 const HAY_BATCH := 6000
 const BUILD_TICK := 0.4
+const BUILD_LAYOUT_TICK := 8.0
+const MAX_BUILD_LAYOUT := 8 << 20
 const STATE_TICK := 0.25
 # The host sends a checksum per 16x16-vertex block of the pile this often. A
 # guest compares it with its own pile and asks for the blocks that drifted.
@@ -41,15 +43,8 @@ const BUILD_ARRAYS := ["conveyors", "corners", "water_mains", "water_splitters",
 	"pelletizers", "generators", "boreholes", "tube_launchers", "dump_hatches",
 	"hay_stairs", "hay_lifts", "splitters", "joiners", "cabinets", "needle_radars",
 	"paint_boards", "work_lamps", "hay_drones", "piston_rakes", "power_poles"]
-const BUILD_SHAPE_KEYS := ["span", "rise", "kind", "sections", "rows", "side"]
-
-# Settings the game keeps in a save's meta and reads back when it loads one,
-# as { the name on Cfg: the name in the meta }. The guest builds its yard out
-# of our payload with the game's own loader, so anything missing here reaches
-# it as a default: shed_long_bays decides how long the warehouse is and where
-# the sell stand goes, and leaving it out put the two players' stands eleven
-# metres apart. Sent only when the game has it, so older builds are untouched.
-const CFG_META := {"shed_long_bays": "shed_bays"}
+const BUILD_SHAPE_KEYS := ["span", "rise", "kind", "sections", "rows", "side",
+	"up", "fwd", "double"]
 
 const ADD_F := ["money", "debt", "hay_total", "hay_dug", "hay_returned", "hay_sold",
 	"money_earned", "stacks_ordered", "needles_found", "pile_needles_found"]
@@ -61,6 +56,8 @@ const HOST_MAX := ["mission_index", "contract_index"]
 
 var avatars := {}
 var _avatar_script: Script
+var _emotes: Script
+var _emote_hands: Node
 var _me: Node  # our own body, seen when looking down
 var props_sync: Node  # loose item replication
 var belts_sync: Node  # what is riding on the belts
@@ -79,6 +76,8 @@ var _bkeys := {}  # key -> building dict
 var _builds_dirty := false
 var _build_t := 0.0
 var _applying_builds := false
+var _build_layout_t := 0.0
+var _last_local_build := -3000
 
 var _st_base := {}
 var _st_pending: Array = []  # [seq, delta]
@@ -103,6 +102,8 @@ func _ready() -> void:
 	builds = world.get("builds")
 	player = world.get("player")
 	_avatar_script = load(mp.base_dir + "/mp_avatar.gd")
+	if ResourceLoader.exists("res://scripts/player/emotes.gd"):
+		_emotes = load("res://scripts/player/emotes.gd")
 	_me = _avatar_script.new()
 	_me.setup_local(player, mp)
 	world.add_child(_me)
@@ -277,6 +278,10 @@ func _process(delta: float) -> void:
 		_state_t = 0.0
 		_state_tick()
 	if mp.is_host:
+		_build_layout_t += delta
+		if _build_layout_t >= BUILD_LAYOUT_TICK:
+			_build_layout_t = 0.0
+			send_build_layout()
 		_hay_sum_t += delta
 		if _hay_sum_t >= HAY_SUM_TICK:
 			_hay_sum_t = 0.0
@@ -296,8 +301,16 @@ func _send_pose() -> void:
 	if player.has_method("crouch_amount"):
 		crouch = float(player.crouch_amount())
 	var moving: float = (player.velocity * Vector3(1, 0, 1)).length() if "velocity" in player else 0.0
+	if not is_instance_valid(_emote_hands) and _emotes != null:
+		_emote_hands = _emotes.call("hands_of", player)
+	var emote := ""
+	var emote_time := 0.0
+	if is_instance_valid(_emote_hands) and _emote_hands.has_method("emote_id"):
+		emote = _emote_hands.call("emote_id")
+		if emote != "":
+			emote_time = float(_emote_hands.get("_emote_t"))
 	mp._rx_pose.rpc(player.global_position, player.rotation.y, pitch,
-		int(player.get("current_tool")), crouch, moving, _hands())
+		int(player.get("current_tool")), crouch, moving, _hands(), emote, emote_time)
 
 
 # What is in our bare hands, in one number: how many straws in the low four
@@ -316,7 +329,7 @@ func _hands() -> int:
 	return straws | (needle << 4)
 
 
-func on_pose(id: int, pos: Vector3, yaw: float, pitch: float, tool: int, crouch: float, moving: float, hands: int = 0) -> void:
+func on_pose(id: int, pos: Vector3, yaw: float, pitch: float, tool: int, crouch: float, moving: float, hands: int = 0, emote: String = "", emote_time: float = 0.0) -> void:
 	_last_at[id] = pos
 	var a: Node = avatars.get(id)
 	if a == null or not is_instance_valid(a):
@@ -326,6 +339,7 @@ func on_pose(id: int, pos: Vector3, yaw: float, pitch: float, tool: int, crouch:
 		a.global_position = pos
 		avatars[id] = a
 	a.set_target(pos, yaw, pitch, tool, crouch, moving)
+	a.set_emote(_emotes, emote, emote_time)
 	if a.has_method("set_hands"):
 		a.set_hands(hands & 15, (hands >> 4) - 1)
 	if strands_sync != null and is_instance_valid(strands_sync):
@@ -524,6 +538,7 @@ func on_hay_want(pid: int, blocks: PackedInt32Array) -> void:
 func _on_builds_changed() -> void:
 	if not _applying_builds:
 		_builds_dirty = true
+		_last_local_build = Time.get_ticks_msec()
 	# a machine placed here would run on its own until the next build tick
 	if _is_client():
 		_freeze_client_machines.call_deferred()
@@ -564,6 +579,44 @@ func _build_tick() -> void:
 	_flush_builds()
 
 
+func builds_busy() -> bool:
+	return _applying_builds
+
+
+func send_build_layout() -> void:
+	if builds == null or _frozen or _applying_builds:
+		return
+	var ready: Array = []
+	for id in mp.players:
+		if id != 1 and mp.players[id]["state"] == "world":
+			ready.append(id)
+	if ready.is_empty():
+		return
+	if _builds_dirty:
+		_flush_builds()
+	var raw := var_to_bytes({
+		"rows": builds.to_array(),
+		"corners": builds.corners.size(),
+	})
+	if raw.size() > MAX_BUILD_LAYOUT:
+		return
+	var packed := raw.compress(FileAccess.COMPRESSION_ZSTD)
+	for id in ready:
+		mp._rx_build_layout.rpc_id(id, packed, raw.size())
+
+
+func on_build_layout(packed: PackedByteArray, raw_size: int) -> void:
+	if builds == null or raw_size <= 0 or raw_size > MAX_BUILD_LAYOUT or _frozen:
+		return
+	# Let the host receive recent edits before applying an automatic snapshot.
+	if Time.get_ticks_msec() - _last_local_build < 2500:
+		return
+	var layout: Variant = bytes_to_var(packed.decompress(raw_size, FileAccess.COMPRESSION_ZSTD))
+	if layout is Dictionary and layout.get("rows") is Array:
+		var repair_belts: bool = int(layout.get("corners", -1)) != builds.corners.size()
+		await _reconcile_builds(layout["rows"], repair_belts)
+
+
 func _flush_builds() -> void:
 	_builds_dirty = false
 	var cur := _scan_builds()
@@ -598,13 +651,31 @@ func on_builds(adds: Array, removes: Array) -> void:
 			if n != null:
 				_demolish(n)
 	if not adds.is_empty():
-		await _add_buildings(adds)
+		var present := _scan_builds()
+		var missing: Array = []
+		for d in adds:
+			if d is Dictionary:
+				var key := _bkey(d)
+				if not present.has(key):
+					present[key] = d
+					missing.append(d)
+		if not missing.is_empty():
+			await _add_buildings(missing)
+	if not adds.is_empty() or not removes.is_empty():
+		_rebuild_belt_junctions()
 	_bkeys = _scan_builds()
 	_builds_dirty = false
 	_applying_builds = false
 	mp.trace.note("builds end")
 	if _is_client():
 		_freeze_client_machines()
+
+
+func _rebuild_belt_junctions() -> void:
+	if builds.has_method("_rebuild_junctions_full"):
+		builds._rebuild_junctions_full()
+	else:
+		builds.rebuild_junctions()
 
 
 func _types_of(dicts: Array) -> String:
@@ -630,10 +701,12 @@ func _find_building(d: Dictionary) -> Node3D:
 		if _bkey(nd) == key:
 			return n
 		var err := 0.0
+		var comparable := false
 		for k in ["position", "a", "b"]:
 			if d.has(k) and nd.has(k) and d[k] is Vector3 and nd[k] is Vector3:
+				comparable = true
 				err += (d[k] as Vector3).distance_to(nd[k])
-		if err < best_err:
+		if comparable and err < best_err:
 			best_err = err
 			best = n
 	return best
@@ -664,6 +737,17 @@ const BUILD_EXTRAS := ["demo_withheld"]
 
 
 func _add_buildings(dicts: Array) -> void:
+	# Recent builds expose the same restore pass without clearing the yard.
+	if builds.has_method("add_rows"):
+		var previous_slice: int = builds.restore_slice_usec
+		builds.restore_slice_usec = 0
+		await builds.add_rows(dicts)
+		builds.restore_slice_usec = previous_slice
+		builds.rebuild_water_joints()
+		builds.fit_posts_to_decks()
+		builds.share_joints()
+		builds.changed.emit()
+		return
 	var parked := {}
 	for a in BUILD_ARRAYS + BUILD_EXTRAS:
 		var arr: Variant = builds.get(a)
@@ -702,7 +786,6 @@ func _add_buildings(dicts: Array) -> void:
 				now_show[k] = on_show_kept[k]
 	if builds.has_method("_rebuild_enclosed_visuals"):
 		builds._rebuild_enclosed_visuals()
-	builds.rebuild_junctions()
 	builds.rebuild_water_joints()
 	builds.fit_posts_to_decks()
 	builds.share_joints()
@@ -1001,44 +1084,18 @@ func build_payload(_pid: int) -> Dictionary:
 	var belts: Dictionary = {}
 	if world.has_method("_belts_to_dict"):
 		belts = world._belts_to_dict()
-	var out := {
-		"version": SaveManager.FORMAT_VERSION,
-		"pile_shape_version": SaveManager.current_pile_shape_version,
-		"state": GameState.to_dict(),
-		"heights": field.heights,
-		"player": xf,
-		"buildings": builds.to_array(),
-		"props": props_arr,
-		"belts": belts,
-		"tech": Tech.to_dict(),
-		"cell": Cfg.CELL,
-		"extent": Cfg.FIELD_EXTENT,
-		"meta": {
-			"name": "Multijugador",
-			"locked": false,
-			"map": SaveManager.current_map,
-			"pile_size": SaveManager.current_pile_size,
-			"saved_at": int(Time.get_unix_time_from_system()),
-			"hay_dug": GameState.hay_dug,
-			"hay_initial": GameState.hay_initial,
-			"hay_total": GameState.hay_total,
-			"needles_found": GameState.needles_found,
-			"money": GameState.money,
-			"money_earned": GameState.money_earned,
-		},
-	}
-	# the pile's starting shape: without it the guest re-shapes the dome from
-	# the seed, which is slow and not what the host's pile was dug from
 	var dome: Variant = field.get("dome")
-	if dome is PackedFloat32Array and (dome as PackedFloat32Array).size() == field.heights.size():
-		out["dome"] = dome
-		out["dome_seed"] = int(field.get("dome_seed"))
-	var meta: Dictionary = out["meta"]
-	for key in CFG_META:
-		# null when this build of the game does not have the setting
-		var v: Variant = Cfg.get(key)
-		if v != null:
-			meta[CFG_META[key]] = v
+	var dome_heights := PackedFloat32Array()
+	var dome_seed := 0
+	if dome is PackedFloat32Array and dome.size() == field.heights.size():
+		dome_heights = dome
+		dome_seed = int(field.get("dome_seed"))
+	# Use the game's save schema so the guest loader receives every yard
+	# setting, including the warehouse grid and the relocated selling stand.
+	var out: Dictionary = SaveManager.build_payload(field.heights, xf,
+		builds.to_array(), props_arr, 0.0, belts, dome_heights, dome_seed)
+	out["meta"]["name"] = "Multijugador"
+	out["meta"]["locked"] = false
 	return out
 
 
@@ -1060,6 +1117,8 @@ func send_full_sync(pid: int) -> void:
 		boards_sync.send_all(pid)
 	if machines_sync != null and is_instance_valid(machines_sync):
 		machines_sync.send_all(pid)
+	if contracts_sync != null and is_instance_valid(contracts_sync):
+		contracts_sync.send_now(pid)
 
 
 func on_full_sync(heights: PackedFloat32Array, host_builds: Array, tech: Dictionary, needles: Array = []) -> void:
@@ -1081,28 +1140,39 @@ func on_full_sync(heights: PackedFloat32Array, host_builds: Array, tech: Diction
 		if not idx.is_empty():
 			on_hay(1, idx, vals)
 		_hay_base = field.heights.duplicate()
-	if builds != null:
-		var want := {}
-		for d in host_builds:
-			if d is Dictionary:
-				want[_bkey(d)] = d
-		var have := _scan_builds()
-		var adds: Array = []
-		var removes: Array = []
-		for k in want:
-			if not have.has(k):
-				adds.append(want[k])
-		for k in have:
-			if not want.has(k):
-				removes.append(have[k])
-		if not adds.is_empty() or not removes.is_empty():
-			_builds_dirty = false
-			await on_builds(adds, removes)
-		_bkeys = _scan_builds()
+	await _reconcile_builds(host_builds)
 	_tech_mute = true
 	Tech.from_dict(tech)
 	_tech_mute = false
 	_st_base = _capture_state()
+
+
+func _reconcile_builds(host_builds: Array, repair_belts: bool = false) -> void:
+	if builds == null or _frozen:
+		return
+	while _applying_builds:
+		await get_tree().process_frame
+	if _builds_dirty:
+		_flush_builds()
+		return
+	var want := {}
+	for d in host_builds:
+		if d is Dictionary:
+			want[_bkey(d)] = d
+	var have := _scan_builds()
+	var adds: Array = []
+	var removes: Array = []
+	for k in want:
+		if not have.has(k):
+			adds.append(want[k])
+	for k in have:
+		if not want.has(k):
+			removes.append(have[k])
+	if not adds.is_empty() or not removes.is_empty():
+		await on_builds(adds, removes)
+	elif repair_belts:
+		_rebuild_belt_junctions()
+	_bkeys = _scan_builds()
 
 
 func _on_pile_replaced() -> void:
